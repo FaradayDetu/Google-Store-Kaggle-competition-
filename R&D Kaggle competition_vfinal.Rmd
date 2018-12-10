@@ -1,0 +1,440 @@
+---
+title: "R&D Kaggle Competition"
+author: "Albert Xavier Lopez Barrantes and Alejandro Encalado Masia"
+date: "23 de octubre de 2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction to the "Google Analytics Customer Revenue Prediction".
+
+>The 80/20 rule has proven true for many businesses-only a small percentage of customers produce most of the revenue. As such, marketing teams are challenged to make appropriate investments in promotional strategies. 
+RStudio, the developer of free and open tools for R and enterprise-ready products for teams to scale and share work, has partnered with Google Cloud and Kaggle to demonstrate the business impact that thorough data analysis can have.
+In this competition, we are challenged to analyze a Google Merchandise Store (also known as GStore, where Google swag is sold) customer dataset to predict revenue per customer. Hopefully, the outcome will be more actionable operational changes and a better use of marketing budgets for those companies who choose to use data analysis on top of GA data.
+
+Since this competition is organized by Google in colaboration with R Studio, we are going to work on this dataset using R and this report will be made in Markdown.
+Notice that in this work we are going to try the existence of transaction or not, we are not going to predict the money spend by transaction.
+
+With all of this, let's start by defining the working directory and downloading the libraries we are going to use:
+
+```{r libraries, message=FALSE, warning=FALSE}
+  library(tidyverse)
+  library(tictoc)
+  library(jsonlite)
+  library(magrittr)
+  library(dplyr)
+  library(naniar)
+  library(reshape2)
+  library(ggplot2)
+  library(Matrix)
+  library(xgboost)
+```
+
+In this competition, Kaggle gives us the dataset split in two files, "train" and "test". So we are gonna be working on the training file until we have our model completed. Due to the size of the file we implemented a simple function that is gives us the time of execution, so we can visualize the remaining time. Also, as the raw data contains some variables stored in JSON format, we are going to define some functions in order to clean the dataset:
+
+```{r functions}
+
+# Function to visualize the dataset upload
+load_info <- function(file){
+  
+  message(paste("Starting the upload..."))
+  tic()
+  train <- read.csv(file, header = TRUE)
+  message(paste("------------------"))
+  message(paste("End of the upload..."))
+  toc() 
+  message(paste("------------------"))
+  
+  return(train)
+}
+
+# Function to remove NAs
+remove_nas <- function(y, list){
+  
+  is_na_val <- function(x) x %in% list
+  y <- mutate_if(y, is.factor,is.character)
+  y <- mutate_if(y, is.logical,is.character)
+  y <- y %>% mutate_all(funs(ifelse(is_na_val(.), NA, .)))
+  y[is.na(y)] <- 0
+  
+  return(y)
+  
+}
+
+# Function to clean the JSON format
+clean_json <- function(data){
+  
+  message(paste("Starting the transformation for JSON format..."))
+  
+  library(jsonlite)
+  flatten_json <- . %>% 
+    str_c(., collapse = ",") %>% 
+    str_c("[", ., "]") %>% 
+    fromJSON(flatten = T)
+  
+
+  
+  parse <- . %>% 
+    bind_cols(flatten_json(.$device)) %>%
+    bind_cols(flatten_json(.$geoNetwork)) %>% 
+    bind_cols(flatten_json(.$trafficSource)) %>% 
+    bind_cols(flatten_json(.$totals)) %>% 
+    select(-device, -geoNetwork, -trafficSource, -totals)
+  
+  tic()
+  train <- parse(data)
+  message(paste("------------------"))
+  message(paste("End of the transformation."))
+  toc()
+  message(paste("------------------"))
+  return(train)
+
+}
+
+
+# Function handle useless information
+trash_info <- function(x) {  
+  trash_list <- c()
+  for (header in colnames(x)) {
+    if (nrow(unique(x[paste(as.character(header))])) == 1) {
+      trash_list <- c(trash_list,as.character(header))
+    }
+  }
+  return(trash_list)
+}
+
+list_not_set <- c("not available in demo dataset", "(not provided)",
+                                  "(not set)", "<NA>", "unknown.unknown","(none)")
+```
+
+Once defined the functions, we are going to upload the datasets and make use of the functions above to clean de JSON format. 
+
+```{r upload}
+# Loading dataset and cleaninng 
+
+#train <- load_info("C:/Users/Albert/Desktop/Data Science/Research and innovation/Kaggle competition/train.csv")
+#test <- load_info("C:/Users/Albert/Desktop/Data Science/Research and innovation/Kaggle competition/test.csv")
+
+train <- load_info("train.csv")
+test <- load_info("test.csv")
+
+# Cleaning the JSON format
+train <- clean_json(train)  
+test <- clean_json(test)  
+
+```
+
+Now we have the dataset uploaded and ready to work on it, it's time to visualize the variables. To do so, we are going to perform a ggplot for missing values in each variable to identify the gaps in the dataset. Notice we just plot a subsample of 200.000 observation from the total of 900000 observation from the test dataset, the overall conclusions will be the same and will require less computation time:
+
+```{r}
+png("g1.png")
+g1 <- head(train,200000) %>% 
+  is.na %>% melt %>%
+  ggplot(data = .,aes(y = Var1,x = Var2)) +
+  geom_raster(aes(fill = value)) + coord_flip() +
+  scale_fill_grey(name = "",labels = c("Present","Missing")) +
+  labs(x = "Observation",y = "Variables")
+print(g1)
+dev.off()
+
+knitr::include_graphics("g1.png")
+```
+
+In this plot we can identify some variables which have almost all the observations with empty values, like for example all variables related to "Ads". Also we identify many variables that even not having any missing values, the values inside are not available like for example "data not available for this demo". All in all, we are going to use functions from the beggining to clean this kind of data. Finally we are going to transform the dataset into tibbles, a format for dataframes provided by "tidyverse" package which performs faster in big datasets.
+
+```{r cleaning}
+train.tash <- trash_info(train)
+test.tash <- trash_info(test)
+
+trash.list <- names(train) %in% trash_info(train)
+trash.list.test <- names(test) %in% trash_info(test)
+
+train <- train[!trash.list]
+test <- test[!trash.list.test]
+
+train <- remove_nas(train,list_not_set)
+test <- remove_nas(test,list_not_set)
+
+# Defining the dataset as a tibble
+train.tib <- as.tibble(train)
+test.tib <- as.tibble(test)
+```
+
+We ended this piece of code by defining the dataset as.tibble. This function from the package "tidyverse" is more efficient when manipulating large datasets in R. Once we have the dataset uploaded and ready to work on it, it's time to visualize the variables. The advantage of working with tibbles is we can define the piece of dataset in the preview print and visualize very fast what type of variable each one is.
+
+```{r dataset}
+print(train.tib, n=7, width=Inf)
+```
+
+Taking into account the information we get from the summary, we will to transform character variables into categorical variables to avoid problems when fitting models. Also, in this section we are going to avoid variables which have almost all observations with missing values, like we saw before, and those variables giving the same information.
+
+```{r Master Table, warning=FALSE}
+
+MT.train <- select(train.tib,
+                   
+#############################################################################
+##     add here new variables, they are already clean (NA -> 0)            ##
+#############################################################################
+
+                   
+                   visitNumber,
+                   medium,
+                   isTrueDirect,
+                   hits,
+                   pageviews,
+                   bounces, 
+                   newVisits,
+                   country,
+                   operatingSystem,
+                   deviceCategory,
+                   browser,
+                   subContinent, 
+                   date,
+                   transactionRevenue)
+
+
+
+MT.test <- select(test.tib,
+                  
+#############################################################################
+##     add here new variables, they are already clean (NA -> 0)            ##
+#############################################################################
+
+                  
+                   visitNumber,
+                   medium,
+                   isTrueDirect,
+                   hits,
+                   pageviews,
+                   bounces, 
+                   newVisits,
+                   country,
+                   subContinent,
+                   operatingSystem,
+                   deviceCategory,
+                   browser,
+                   date)
+
+###########################################################################
+
+############################################################################
+
+##      Most relevant information in subContinent variable               ##
+
+###########################################################################
+
+
+ 
+ MT.train$aux_ind <- 0
+ MT.test$aux_ind <- 0
+
+ MT.train$aux_ind[MT.train$subContinent == "Northern America"] <- 1
+ MT.train$aux_ind[MT.train$subContinent == "South America"] <- 1
+ MT.train$aux_ind[MT.train$subContinent == "Eastern Asia"] <- 1
+ 
+ MT.test$aux_ind[MT.test$subContinent == "Northern America"] <- 1
+ MT.test$aux_ind[MT.test$subContinent == "South America"] <- 1
+ MT.test$aux_ind[MT.test$subContinent == "Eastern Asia"] <- 1
+
+
+ 
+ MT.train$subContinent[MT.train$aux_ind == 0] <- "other"
+ MT.test$subContinent[MT.test$aux_ind == 0] <- "other"
+
+ MT.train <- select(MT.train, -aux_ind)
+ MT.test <- select(MT.test, -aux_ind)
+
+
+
+
+#############################################################################
+
+MT.train <- mutate(MT.train,
+                   
+#############################################################################
+##                  Formating variables                                    ##
+#############################################################################
+
+                   transactionRevenue = as.double(transactionRevenue),
+                   
+                   visitNumber = as.integer(visitNumber),
+                   medium = as.factor(medium),
+                   isTrueDirect = as.integer(isTrueDirect),
+                   hits = as.integer(hits),
+                   pageviews = as.integer(pageviews),
+                   bounces = as.integer(bounces),
+                   newVisits = as.integer(newVisits),
+                   country = as.factor(country),
+                   subContinent = as.factor(subContinent),
+                   operatingSystem = as.factor(operatingSystem),
+                   deviceCategory=as.factor(deviceCategory),
+                   browser=as.factor(browser),
+                   date = as.Date(as.character(date),"%Y%m%d"))
+
+
+MT.test <- mutate(MT.test,
+                  
+#############################################################################
+##                       Formating variables                               ##
+#############################################################################
+                   
+                   visitNumber = as.integer(visitNumber),
+                   medium = as.factor(medium),
+                   isTrueDirect = as.integer(isTrueDirect),
+                   hits = as.integer(hits),
+                   pageviews = as.integer(pageviews),
+                   bounces = as.integer(bounces),
+                   newVisits = as.integer(newVisits),
+                   country = as.factor(country),
+                   subContinent = as.factor(subContinent),
+                   operatingSystem = as.factor(operatingSystem),
+                   deviceCategory=as.factor(deviceCategory),
+                   browser=as.factor(browser),
+                   date = as.Date(as.character(date),"%Y%m%d"))
+
+
+#############################################################################
+##     Conversion of transaction revenue                                   ##
+#############################################################################
+
+MT.train$transaction[MT.train$transactionRevenue > 0] <- 1
+MT.train$transaction[MT.train$transactionRevenue == 0] <- 0
+MT.train <- select(MT.train , -transactionRevenue)
+
+```
+
+At this point we have all work done on the dataset and it's ready to be used and apply some models on it. 
+we decided we had to become the problem into a binary solution first. 
+
+As we commented bellow, we are going to predict number if there is transaction or not.The reason is only 1% of the observations buy something in the GStore, so if we try to predict an amount of money spend it would be impossible from the beginning since most of them don't spend anything. So we created the variable "transaction" to use as a target variable in a binary problem. 
+After this decision, the problem becomes easier in conceptual terms since we know we have to apply models for a binary classification problem. Of course, the first one that came into our mind was the Logistic Model.
+
+##Logistic Regression Model
+
+
+
+
+
+```{r logistic regression, warning=FALSE}
+# Subsamples
+set.seed(100)
+ind<-sample(2, nrow(MT.train), replace = T, prob=c(0.7, 0.3))
+train1<-MT.train[ind==1,]
+test2<-MT.train[ind==2,]
+
+#Logistic function
+logis<-glm(transaction ~ medium + deviceCategory + hits + pageviews + subContinent + newVisits + isTrueDirect + visitNumber, data=train1, family="binomial")
+summary(logis)
+
+#Predictions
+p1<-predict(logis, train1, type = "response")
+head(p1)
+
+#Classification error:
+pred1<-ifelse(p1>0.01, 1, 0)
+tab1<-table(Predicted= pred1, Actual=train1$transaction)
+tab1
+```
+
+Overall, we ended having the variables with more p-value, which mean they have more power of disrimination. 
+From this first model we can see how the number of hits sombedy does when navigating in the website, the number of pageviews and the device they are using, can be explaining part of the possible outcome.
+
+Since the balance of our dataset is 1% "1" (buy) and 99% "0" (don't buy anything), the initial break point to build our predictions is 0.01 and doing so que get the confusion matrix above. Having 11.000 of posibles "1" outcomes, almost 80% of them are well classified, but then the model predicts many "1" that shouldn't be. This started to made us think about the imbalance of the dataset and how difficult is for any model to perform well when the training set has that imbalance.
+
+
+## X Gradient Boosting Model
+
+Once we have the data ready to be used, we can perform our model from the package xgboost. The model we have chose it is called extreme gradient boosting. This model is based on gradient descent, for each iteration, it is computed a "weak" learner based on gradient descent algorithm.
+It is called extreme because it improves the computation in comparison with other packages related to this algorithm. For instance, xgboost package supports parallel computation and it is supposed to be arround 10 times faster than the other gradient boosting packages.
+
+The computation is performed in order to find a model $F_{( \hat x)}$ where the mean squared error, defined by $MSE{x} =  \Sigma |() y - F _{\hat x})|$ is minimum, where $y$ i s the target value, which is the quantity we want to predict.
+
+Gradient boosting algorithm assumes that at some point of the iteration it exist a model where $F__m(\hat x) = F_{m-1}(\hat x) + h(\hat x) = y$. So, at each step, $h(\hat x)$ changes, and it is used to improve the next iteration. 
+
+
+
+```{r xgboost Train & Validation sets}
+
+#Creation train and validation sets with the same proportions of transaction #
+
+MT.train.transaction <- filter(MT.train, transaction == 1)
+ind_transaction <- sample(2, nrow(MT.train.transaction), replace = T, prob = c(0.5,0.5))
+
+MT.train.no.transaction <- filter(MT.train, transaction == 0)
+ind_no.transaction <- sample(2, nrow(MT.train.no.transaction), replace = T, prob = c(0.5,0.5))
+
+GB.train.1 <- MT.train.transaction[ind_transaction == 1,]
+GB.train.2 <- MT.train.no.transaction[ind_no.transaction == 1,]
+
+GB.train <- rbind(GB.train.1,GB.train.2)
+
+ind_rand_train <- sample(nrow(GB.train), nrow(GB.train), replace = F)
+
+GB.train <- cbind(GB.train, ind_rand_train)
+GB.train <- arrange(GB.train, ind_rand_train)
+
+GB.val.1 <- MT.train.transaction[ind_transaction == 2,]
+GB.val.2 <- MT.train.no.transaction[ind_no.transaction == 2,]
+
+GB.val <- rbind(GB.val.1,GB.val.2)
+
+ind_rand_val <- sample(nrow(GB.val), nrow(GB.val), replace = F)
+GB.val <- cbind(GB.val, ind_rand_val)
+GB.val <- arrange(GB.val, ind_rand_val)
+
+# Substracting the variables we don't need for gradient boosting algorithm
+GB.train <- select(GB.train,-isTrueDirect, -ind_rand_train, -date, -country)
+GB.val <- select(GB.val,-isTrueDirect, -ind_rand_val,-date,-country)
+
+
+```
+
+
+```{r xgboost}
+#Format factors into dummy variables
+trainm <- sparse.model.matrix(transaction ~. -transaction, data = GB.train )
+valm <- sparse.model.matrix(transaction ~. -transaction, data = GB.val )
+
+#Setting the labels
+train_label <- GB.train$transaction
+val_label <- GB.val$transaction
+
+#Creating the matrix for the model 
+train_matrix <-xgb.DMatrix(data = as.matrix(trainm), label = train_label)
+val_matrix <-xgb.DMatrix(data = as.matrix(valm), label = val_label)
+
+#Running x gradient boosting model & making the prediction table
+model <- xgboost(data = train_matrix, nrounds = 20)
+predictionxgb <- predict(model, valm)
+
+predictionxgb <- ifelse(predictionxgb> 0.4 , 1, 0)
+
+#Confusion matrix and accuracy
+confusion.matrix <- table(Predicted = predictionxgb, Actual = GB.val$transaction)
+accuracy <- diag(confusion.matrix)/sum(confusion.matrix)
+
+print(confusion.matrix)
+print(accuracy)
+
+```
+Althought the accuracy is high, we cannot conclude this is the best model. Just 1841 transactions are predicted, over 5729, and the aim of the problem is to find who would buy products, not who wouldn't. So, or gradient boosting is not the proper model, or we didn't perform a good feature engineering. 
+
+
+##Conclusions
+
+In our opinion, the point is that we haven't select the correct variables to do our prediction, as we show bellow, we have select only these features we know what it is, and the rest were discarted. And we think this is why our predictions are not good. 
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
